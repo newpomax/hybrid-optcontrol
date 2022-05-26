@@ -127,8 +127,7 @@ h = lambda s: 1
 t = np.arange(0., T + dt, dt)
 N = t.size - 1
 
-u_ref = 0.1*((u_range[0,1]-u_range[0,0])*rng.random((N,1)) - u_range[0,0]) # generate reference control from random control within limits
-u_ref = 8*np.ones((N,1))
+u_ref = 0.1*(u_range[0,1]-u_range[0,0])*rng.random((N,1)) + u_range[0,0] # generate reference control from random control within limits
 
 Thrustgoal = np.array([thrust_goal(t[i]) for i in range(N)])
 print('Min thrust = %0.1f N at mox = %0.2f kg/s'%(thrust(s0,u_range[0,0]),u_range[0,0]))

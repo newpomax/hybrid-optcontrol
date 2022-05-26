@@ -42,7 +42,7 @@ t = np.arange(0., T + dt, dt)
 N = t.size - 1
 
 # generate reference control from random control within limits
-u_ref = 0.1*((u_range[0,1]-u_range[0,0])*rng.random((N,m)) - u_range[0,0])
+u_ref = 0.1*(u_range[0,1]-u_range[0,0])*rng.random((N,m)) + u_range[0,0]
 
 s,u,L,l = iLQR.iLQR(springdamp, c, h, u_ref, N, s0, u_range, dt = dt, tol = 1E-1)
 

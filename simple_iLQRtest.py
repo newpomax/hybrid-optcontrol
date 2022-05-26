@@ -29,7 +29,7 @@ c = lambda s,u,t: 0.5*(s-sgoal).T@Q@(s-sgoal) + 0.5*u@R@u # cost function
 h = lambda s: 0.5*(s-sgoal).T@P@(s-sgoal) # terminal cost function
 
 # generate reference trajectory from random control within limits
-u_ref = 0.1*((u_range[0,1]-u_range[0,0])*rng.random((N,m)) - u_range[0,0])
+u_ref = 0.1*(u_range[0,1]-u_range[0,0])*rng.random((N,m)) + u_range[0,0]
 
 # test iLQR
 s,u,L,l = iLQR.iLQR(f, c, h, u_ref, N, s0, u_range, dt = dt, tol = 1E-5)
