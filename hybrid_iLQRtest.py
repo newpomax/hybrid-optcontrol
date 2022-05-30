@@ -28,7 +28,7 @@ r0 = 0.0508 #m ,initial radius
 L = 1.143 # m, length of grain
 tburn = 30 # end of simulation
 
-Athroat = np.pi*(0.05**2) # 5 cm radius nozzle? guessing here
+Athroat = np.pi*(0.05**2) # 2 cm radius nozzle? guessing here
 exp_ratio = 3.2 # again, guessing
 mox_max = 1.7*2.55*5 # kg/s, guessing from value used in example with multiplicative factor
 
@@ -73,28 +73,30 @@ mdotmin = np.amax(mdot.reshape((-1,num_cols))[:,0])
 mdotmax = np.amin(mdot.reshape((-1,num_cols))[:,-1])
 mdot_range = np.linspace(mdotmin,mdotmax,10) # create regular grid of mdot
 P = np.array([getP(of, m) for (of,m) in product(OF.reshape((-1,num_cols))[:,0],mdot_range)]) # calculate pressure as function of mdot, OF
+Pe = Pt * ( 1 + 0.5*(gamma-1)*(Me**2) )**(-gamma/(gamma-1))
 Ue = Me*np.sqrt(gamma * Ru/mw * Tt) # exhaust velocity
 
 # Create interpolative functions, using Adam Coogan's jaxinterp2d
-fP = CartesianGrid(((OFmin,OFmax),(mdotmin,mdotmax)), P.reshape((num_rows,-1))) # use this to locate current chamber pressure from OF, mdot
+fPcc = CartesianGrid(((OFmin,OFmax),(mdotmin,mdotmax)), P.reshape((num_rows,-1))) # use this to locate current chamber pressure from OF, mdot
+fPe = CartesianGrid(((OFmin,OFmax),(Pmin,Pmax)), Pe.reshape((-1,num_cols))) # use this to locate current chamber pressure from OF, mdot
 fUe = CartesianGrid(((OFmin,OFmax),(Pmin,Pmax)), Ue.reshape((-1,num_cols))) # from known OF, P - calculate exit vel
 
 ##         Hybrid functions            ##
 #---------------------------------------#
-@partial(jax.jit,static_argnums=(2,3,4,5,6))
-def thrust(r:np.ndarray,mox:np.ndarray,fP:callable=fP,fUe:callable=fUe,exp_ratio=exp_ratio,Pamb=Pamb,Athroat=Athroat):   
+@partial(jax.jit,static_argnums=(2,3,4,5,6,7))
+def thrust(r:np.ndarray,mox:np.ndarray,fPcc:callable=fPcc,fPe:callable=fPe,fUe:callable=fUe,exp_ratio=exp_ratio,Pamb=Pamb,Athroat=Athroat):   
     mfuel = mf(r,mox)[-1] # calculate total fuel flow rate
     # Given a known OF and total mass flow rate, find the resulting thrust
     OF = mox/mfuel 
     mdot = mox+mfuel
-    Pt = fP(OF, mdot) # find chamber pressure that satisfies mass flow
-    Thrust = mdot*fUe(OF,Pt) #  + exp_ratio*Athroat*(Pt-Pamb)
+    Pcc = fPcc(OF, mdot) # find chamber pressure that satisfies mass flow
+    Thrust = mdot*fUe(OF,Pcc) + exp_ratio*Athroat*(fPe(OF,Pcc)-Pamb)
     return Thrust
 
 @partial(jax.jit,static_argnums=(2,3,4,5,6))
 def mf(r:np.ndarray,mox:np.ndarray,x=x,a:float=a,n:float=n,m:float=m,rhof:float=rhof):
     mf = jnp.zeros(r.shape)
-    for i in range(mf.size):
+    for i in range(mf.size): # make this jit-friendly!
         if i == 0:
             mflast = 0 # fuel flow at start of port is zero
             dx = x[0]
@@ -119,10 +121,10 @@ sgoal = thrust_goal
 dt = 0.1                      # discrete time resolution
 u_range = jnp.array([[0.75*mdotmin, 0.75*mdotmax]]) # control range
 T = tburn
-Q = 10*np.eye(1)                 # state cost matrix
-R = 100*np.eye(1)                # control cost matrix
-# c = lambda s,u,t: (thrust(s,u)-thrust_goal(t)).T@Q@(thrust(s,u)-thrust_goal(t)) + u@R@u   # cost function
-c = lambda s,u,t: (thrust(s,u)-thrust_goal(t)).T@Q@(thrust(s,u)-thrust_goal(t)) # cost function (no control penalty)
+Q = 1*np.eye(1)                 # state cost matrix
+R = 1e3*np.eye(1)                # control cost matrix
+c = lambda s,u,t: (thrust(s,u)-thrust_goal(t)).T@Q@(thrust(s,u)-thrust_goal(t)) + u@R@u   # cost function
+# c = lambda s,u,t: (thrust(s,u)-thrust_goal(t)).T@Q@(thrust(s,u)-thrust_goal(t)) # cost function (no control penalty)
 h = lambda s: 1
 t = np.arange(0., T + dt, dt)
 N = t.size - 1
@@ -132,7 +134,7 @@ u_ref = 0.1*(u_range[0,1]-u_range[0,0])*rng.random((N,1)) + u_range[0,0] # gener
 Thrustgoal = np.array([thrust_goal(t[i]) for i in range(N)])
 print('Min thrust = %0.1f N at mox = %0.2f kg/s'%(thrust(s0,u_range[0,0]),u_range[0,0]))
 print('Max thrust = %0.1f N at mox = %0.2f kg/s'%(thrust(s0,u_range[0,1]),u_range[0,1]))
-print('Min target thrust = %0.1f N, max target thrust = %0.1f N'%(np.amax(Thrustgoal),np.amin(Thrustgoal)))
+print('Min target thrust = %0.1f N, max target thrust = %0.1f N'%(np.amin(Thrustgoal),np.amax(Thrustgoal)))
 
 print('Starting iLQR')
 R,MOX,L,l = iLQR.iLQR(f, c, h, u_ref, N, s0, u_range, dt = dt, tol = 1E-1)
@@ -145,6 +147,8 @@ OF = MF/MOX
 MTOT = MF + MOX
 Thrust = np.array([thrust(R[i,:],MOX[i]) for i in range(N)])
 
+
+# plot
 plt.figure()
 num_curves = min(10,N)
 for i in range(num_curves):

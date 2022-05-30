@@ -7,6 +7,7 @@ from tqdm.auto import tqdm
 from functools import partial
 import cvxpy as cvx
 
+@partial(jax.jit)
 def regularize(A: jnp.ndarray, λ:float):
     w,v = jnp.linalg.eig(A)
     w = jnp.real(w)
@@ -53,6 +54,7 @@ def quadratize_cost(c: callable,
     
     return Q,θ,q,R,r,P
 
+@partial(jax.jit, static_argnums=(0,))
 def rk4(f,s,u,dt):
     k1 = dt * f(s, u)
     k2 = dt * f(s + k1 / 2, u)
@@ -69,7 +71,7 @@ def discretize(f,dt):
     
     return integrator
 
-def LQR_iteration(fd: callable, c: callable, h: callable, N: int, u_bar:np.ndarray, s_bar:np.ndarray, s0: np.ndarray, u_range:np.ndarray, λ:float, dt:float, near_sol:bool = False):
+def LQR_iteration(fd: callable, c: callable, h: callable, N: int, u_bar:np.ndarray, s_bar:np.ndarray, s0: np.ndarray, u_range:np.ndarray, λ:float, tspan:np.ndarray, near_sol:bool = False, tstart:float = 0):
     """ Solve a single LQR sub-problem with discretized dynamics `fd(s,u)`, cost function
         `c(s,u,t)`, reference linear control law `F` for augmented delta dynamics, reference control `u_bar`,
         reference trajectory `s_bar`, initial state `s0`, and Levenberg-Marquardt constant λ.
@@ -88,13 +90,13 @@ def LQR_iteration(fd: callable, c: callable, h: callable, N: int, u_bar:np.ndarr
     
     
     # Calculate terminal cost from quadratizing `h(s)`
-    S[-1], ς[-1], s[-1] = quadratize_cost(lambda s,u,t: h(s), s_bar[N], jnp.zeros_like(u_bar[0]), dt*(N))[:3] # get terminal state cost
+    S[-1], ς[-1], s[-1] = quadratize_cost(lambda s,u,t: h(s), s_bar[N], jnp.zeros_like(u_bar[0]), tspan[-1])[:3] # get terminal state cost
     
     # Backwards pass, recursing on cost-to-go
     for i in range(N-1,-1,-1):
         # Linearize and quadratize
         A, B = linearize_dynamics(fd, s_bar[i], u_bar[i])
-        Q, θ, q, R, r, P = quadratize_cost(c, s_bar[i], u_bar[i], i*dt)
+        Q, θ, q, R, r, P = quadratize_cost(c, s_bar[i], u_bar[i], tspan[i])
         
         # Form intermediates
         H = R + B.T@S[i+1]@B
@@ -134,10 +136,10 @@ def LQR_iteration(fd: callable, c: callable, h: callable, N: int, u_bar:np.ndarr
         s[i] = q + s[i+1] + 0.5*l[i].T@H@l[i] + l[i].T@g
     
     # Forward pass, simulating new control to get new reference trajectory
-    new_s_bar, new_u_bar, new_cost = simulate(fd, c, h, L, l, u_bar, s_bar, s0, N, u_range, dt) # forward pass - simulate reference control foward using augmented dynamics
+    new_s_bar, new_u_bar, new_cost = simulate(fd, c, h, L, l, u_bar, s_bar, s0, N, u_range, tspan) # forward pass - simulate reference control foward using augmented dynamics
     return L, l, new_u_bar, new_s_bar, new_cost
-    
-def simulate(fd:callable, c:callable, h:callable, L: np.ndarray, l:np.ndarray, u_bar: np.ndarray, s_bar: np.ndarray, s0: np.ndarray, N:int, u_range:np.ndarray, dt:float):
+
+def simulate(fd:callable, c:callable, h:callable, L: np.ndarray, l:np.ndarray, u_bar: np.ndarray, s_bar: np.ndarray, s0: np.ndarray, N:int, u_range:np.ndarray, tspan:np.ndarray):
     """ Simulate the results of a linear control matrix `F` for `N` time steps via the discretized 
         delta dynamics function 'fd(s,u)' given an initial state, `s0`. 
     """
@@ -149,18 +151,19 @@ def simulate(fd:callable, c:callable, h:callable, L: np.ndarray, l:np.ndarray, u
         ds = jnp.array(s[i]-s_bar[i],ndmin=2).T # control law is based on distance from reference, s_bar
         u[i] = jnp.squeeze( L[i]@ds + l[i] + jnp.array(u_bar[i],ndmin=2).T ) # output of control is difference from reference, u_bar
         u[i] = jnp.clip(u[i],u_range[:,0],u_range[:,1])  # impose control contraint
-        cost += c(s[i],u[i],i*dt)
+        cost += c(s[i],u[i],tspan[i])
         s[i+1] = s[i] + fd(s[i],u[i]) # use discretized function to integrate
     cost += h(s[N])
     return s, u, cost
 
 def iLQR(f:callable, c:callable, h:callable, u_ref: np.ndarray, N: int, s0: np.ndarray, u_range:np.ndarray,
-         dt:float = 1E-2, max_iters:int = 400, tol: float = 1E-4, λmax:float= 1000):
+         tspan:np.ndarray, max_iters:int = 400, tol: float = 1E-4, λmax:float= 1000):
     """ Solve the iLQR problem for a system with discrete dynamics `f(s,u)`, cost function
         `c(s,u)`, terminal cost `h(s)`, initial reference control `uref`, number of time steps `N+1`, initial state `s0`,
         time step `dt`, max number of iterations 'max_iters', and convergence tolerance `tol`.
     """
-    fd = jax.jit(discretize(f,dt)) # discretized function for true dynamics (used for simulation)
+    dt = tspan[1]-tspan[0] # assume regular time step size
+    fd = discretize(f,dt) # discretized function for true dynamics (used for simulation)
     
     # Create initial reference trajectory from initial reference control, and compute its cost
     s_bar = np.zeros((N+1,s0.size))
@@ -184,7 +187,7 @@ def iLQR(f:callable, c:callable, h:callable, u_ref: np.ndarray, N: int, s0: np.n
         near_sol = cost_dif > 0 and cost_dif < 1.1*tol and u_dif > 0 and u_dif < 1.1*tol and k > 0 and not np.isinf(cost) # if within order of magnitude, use optimal solver instead of back-tracer
         if near_sol:
             print('Near solution! Moving to more optimal solver...')
-        L, l, new_u_bar, new_s_bar, new_cost = LQR_iteration(fd, c, h, N, u_bar, s_bar, s0, u_range, λ, dt, near_sol) 
+        L, l, new_u_bar, new_s_bar, new_cost = LQR_iteration(fd, c, h, N, u_bar, s_bar, s0, u_range, λ, tspan, near_sol = near_sol) 
         if k > 0 and not np.isinf(cost):
             u_dif = np.amax(np.linalg.norm((u_bar - new_u_bar),np.inf,axis=1))
             cost_dif = abs((new_cost-cost)/cost)
