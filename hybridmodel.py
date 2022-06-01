@@ -1,4 +1,5 @@
 import iLQR
+import UKF
 import importlib
 import numpy as np
 import jax
@@ -24,7 +25,7 @@ class hybrid():
         self.Ru = 8.31446261815324 # J/K/mol, universal gas constant
         
         self.L = 1.143 # m, length of grain
-        self.tburn = 10 # end of simulation
+        self.tburn = 15 # end of simulation
         
         self.Athroat = np.pi*(0.05**2) # 2 cm radius nozzle? guessing here
         self.exp_ratio = 3.2 # again, guessing
@@ -36,6 +37,7 @@ class hybrid():
         self.x = np.logspace(np.log(x_start)/np.log(logbase), np.log(self.L)/np.log(logbase), num = self.k, base = logbase) # create logarithmically-spaced points to track curvature near port start
         
         self.N = 100 # number of time steps
+        self.Rmax = 0.10 # maximum grain radius
         
         self.loadcombdata("CEA/ParaffinLOXCEA.csv")
         
@@ -45,7 +47,9 @@ class hybrid():
     def target_thrust(self,t):
         # Target thrust
         period = 2
-        return 35E3 + 1E3*(((t//period)%2)*2 - 1) # N, target thrust in time
+        # return 38E3 + 2E3*(((t//period)%2)*2 - 1) # square wave
+        return 25E3 + 1E3*jnp.sin(2*np.pi*t/period) # sinusoid
+        # return 35E3 # constant
     
     def r0(self,x):
         return 0.0508*np.ones_like(x)
@@ -107,6 +111,16 @@ class hybrid():
         Pcc = self.fPcc(OF, mdot) # find chamber pressure that satisfies mass flow
         Thrust = mdot*self.fUe(OF,Pcc) + self.exp_ratio*self.Athroat*(self.fPe(OF,Pcc)-self.Pamb)
         return Thrust
+    
+    @partial(jax.jit,static_argnums=(0,))
+    def thrustandpress(self,r:np.ndarray,mox:np.ndarray,a,n,m):   
+        mfuel = self.mf(r,mox,a,n,m)[-1] # calculate total fuel flow rate
+        # Given a known OF and total mass flow rate, find the resulting thrust
+        OF = mox/mfuel 
+        mdot = mox+mfuel
+        Pcc = self.fPcc(OF, mdot) # find chamber pressure that satisfies mass flow
+        Thrust = mdot*self.fUe(OF,Pcc) + self.exp_ratio*self.Athroat*(self.fPe(OF,Pcc)-self.Pamb)
+        return Thrust, Pcc
 
     @partial(jax.jit,static_argnums=(0,))
     def mf(self,r:np.ndarray,mox:np.ndarray,a,n,m):
@@ -143,7 +157,7 @@ class hybrid():
         Q = 1*np.eye(1)                 # state cost matrix
         R = 1e3*np.eye(1)                # control cost matrix
         thrust = lambda s,u : self.thrust(s,u,a,n,m)
-        c = lambda s,u,t: (thrust(s,u)-self.target_thrust(t)).T@Q@(thrust(s,u)-self.target_thrust(t)) + u@R@u  
+        c = lambda s,u,t: (thrust(s,u)-self.target_thrust(t)).T@Q@(thrust(s,u)-self.target_thrust(t)) + jnp.sum(jnp.exp((s-self.Rmax)*2500)) 
         h = lambda s: 1 #terminal penalty
         self.t_iLQR = trange
         
@@ -158,7 +172,7 @@ class hybrid():
         self.R_bar,self.MOX_bar,self.L,self.l = iLQR.iLQR(f, c, h, u_ref, N, s0, u_range, trange, tol = tol)
         self.a_bar, self.n_bar, self.m_bar = (a, n, m)
         
-    def simulate(self, trange = np.nan, a = np.nan, a_σ = 0, m = np.nan, m_σ = 0, n = np.nan, n_σ = 0, r0 = np.nan, r0_σ = 0):
+    def simulate(self, trange = np.nan, a0 = np.nan, a_σ = 0, m0 = np.nan, m_σ = 0, n0 = np.nan, n_σ = 0, r0 = np.nan, r_σ = 0):
         if self.t_iLQR is None:
             print('Run iLQR before trying to simulate.')
             return
@@ -166,7 +180,7 @@ class hybrid():
             trange = np.linspace(0,self.tburn,self.N+1)
         if np.any(np.isnan(r0)):
             r0 = self.r0(self.x)
-        params = [a, n, m]
+        params = [a0, n0, m0]
         selfparams = [self.a, self.n, self.m]
         a,n,m = np.where(np.isnan(params), selfparams, params) # replace nans with self values
         
@@ -177,30 +191,46 @@ class hybrid():
             k4 = dt * f(s + k3, u)
             return (k1 + 2 * k2 + 2 * k3 + k4) / 6
         
+        # Initialize storage arrays
         N = trange.size - 1
-        a_true = np.zeros((N,1)) # record truth parameter values for simulation
-        n_true = np.zeros((N,1)) 
-        m_true = np.zeros((N,1))
+        a_true = self.a + self.rng.normal(scale=a_σ)*np.ones((N+1,1)) # record truth parameter values for simulation
+        n_true = self.n + self.rng.normal(scale=n_σ)*np.ones((N+1,1))
+        m_true = self.m + self.rng.normal(scale=m_σ)*np.ones((N+1,1))
+        a_sim = a*np.ones((N+1,1)) # record truth parameter values for simulation
+        n_sim = n*np.ones((N+1,1)) 
+        m_sim = m*np.ones((N+1,1))
         MOX = np.zeros((N,1))
         R = np.zeros((N+1,self.k)) # our estimate of port radius in time
         R_true = np.zeros((N+1,self.k)) # true port radius in time
-        R[0] = r0
-        R_true[0] = self.rng.normal(loc=self.r0(self.x),scale = r0_σ,size=r0.size) # add noise to true initial port radius
-        dt = self.tburn/N
+        R_true[0] = self.r0(self.x) + self.rng.normal(scale = r_σ, size=r0.size) # add noise to true initial port radius
+        R[0] = r0 + self.rng.normal(scale=r_σ, size = r0.size)
+        dt = self.tburn/N        
+        
         for i in range(N):
-            # generate noisy truth parameter values, clipping to reasonable range
-            a_true[i] = np.clip(self.rng.normal(loc = self.a, scale = a_σ), 0.1*self.a, 10*self.a)
-            n_true[i] = np.clip(self.rng.normal(loc = self.n, scale = n_σ), 0.1*self.n, 10*self.n)
-            m_true[i] = np.clip(self.rng.normal(loc = self.m, scale = m_σ), 0.1*self.m, 10*self.m)
-            # compute estimate from 
+            # Noisy measurement of state
+            # compute new control based on best estimate of current state
             ds = R[i] - self.R_bar[i] # compute delta between estimate and reference
             MOX[i] = self.MOX_bar[i] + self.L[i]@ds + self.l[i] # control output based on known info
-            R[i+1] = R[i] + rk4(lambda s,u: self.rdot(s,u,a,n,m),R[i],MOX[i],dt) # simulate based on guessed values of a,n,m
-            R_true[i+1] = R_true[i] + rk4(lambda s,u: self.rdot(s,u,a_true[i],n_true[i],m_true[i]),R_true[i],MOX[i],dt) # simulate based on noisy truth
-        self.a_sim, self.n_sim, self.m_sim = (a*np.ones((N,1)),n*np.ones((N,1)),m*np.ones((N,1)))
+            # integrate true dynamics (no noise on port growth, just parameters)
+            R_true[i+1] = R_true[i] + rk4(lambda s,u: self.rdot(s,u,a_true[i],n_true[i],m_true[i]),R_true[i],MOX[i],dt)
+            R[i+1] = R_true[i+1] + self.rng.normal(scale=r_σ, size = r0.size)
+            # add noise to truth parameter values, clipping to reasonable range
+            a_true[i+1] = self.a + self.rng.normal(scale = a_σ)
+            n_true[i+1] = self.n + self.rng.normal(scale = n_σ)
+            m_true[i+1] = self.m + self.rng.normal(scale = m_σ)
+            # compute noisy measurements of current state: thrust and chamber pressure
+            a_sim[i+1] = a
+            n_sim[i+1] = n
+            m_sim[i+1] = m
+            
+        self.a_sim, self.n_sim, self.m_sim = (a_sim,n_sim,m_sim)
         self.R_sim, self.R_true, self.MOX_sim, self.a_true, self.n_true, self.m_true = (R,R_true,MOX,a_true,n_true,m_true)
         self.t_sim = trange
         self.plot_output(True)
+        
+    def get_measurement(self,R,MOX,a,n,m):   
+        thrust, press = self.thrustandpress(R,MOX,a,n,m)
+        return np.squeeze(np.array([thrust,press]))
         
     def plot_output(self,plot_sim=False):
         if self.t_iLQR is None:
@@ -231,13 +261,15 @@ class hybrid():
         MTOT_bar = MF_bar + MOX_bar
         Thrust_bar = np.array([self.thrust(R_bar[i,:],MOX_bar[i],self.a_bar,self.n_bar,self.m_bar) for i in range(N_bar)])
         
-        plt.figure(figsize = (8,6))
+        plt.figure(figsize = (16,24))
+        plt.subplot(311)
         num_curves = min(5,N_bar)
         c = np.arange(1, num_curves + 1)
         norm = mpl.colors.Normalize(vmin=c.min(), vmax=c.max())
         cmap = mpl.cm.ScalarMappable(norm=norm, cmap=mpl.cm.jet)
         cmap.set_array([])
         ts = ['']*num_curves
+        plt.axhline(self.Rmax,color='k',linestyle='--',label='$R_{max}$')
         for i in range(num_curves):
             thisi = i*(N_bar//(num_curves-1))
             ts[i] = str(self.t_iLQR[thisi])
@@ -263,64 +295,67 @@ class hybrid():
         plt.ylabel('$r$, m')
         plt.title('Port radius in time')
 
-        plt.figure()
-        plt.plot(self.t_iLQR[:-1],Thrust_bar,label='Thrust, ref.')
+        plt.subplot(323)
+        plt.plot(self.t_iLQR[:-1],self.Thrustgoal,'k:^',label='Target')
+        plt.plot(self.t_iLQR[:-1],Thrust_bar,'k',label='Ref.')
         if plot_sim:
-            plt.plot(self.t_sim[:-1],Thrust,':^',label='Thrust, sim est.')
-            plt.plot(self.t_sim[:-1],Thrust_true,'--',label='Thrust, sim truth')
+            # plt.plot(self.t_sim[:-1],Thrust,':^',label='Thrust, sim est.')
+            plt.plot(self.t_sim[:-1],Thrust_true,'k--',label='Sim.')
         plt.xlabel('$t$, s')
         plt.ylabel('$F_{Thrust}$, N')
         plt.title('Thrust')
         plt.legend()
 
-        plt.figure()
-        plt.plot(self.t_iLQR[:-1],OF_bar,label='ref.')
+        plt.subplot(324)
+        plt.plot(self.t_iLQR[:-1],OF_bar,'k',label='Ref.')
         if plot_sim:
-            plt.plot(self.t_sim[:-1],OF,':^',label='sim est.')
-            plt.plot(self.t_sim[:-1],OF_true,'--',label='sim true')
+            # plt.plot(self.t_sim[:-1],OF,':^',label='sim est.')
+            plt.plot(self.t_sim[:-1],OF_true,'k--',label='Sim.')
         plt.xlabel('$t$, s')
         plt.ylabel('OF')
         plt.title('OF')
         plt.legend()
         
-        plt.figure()
-        plt.plot(self.t_iLQR[:-1],MF_bar,label='$\dot{m}_{fuel}$, ref.')
+        plt.subplot(325)
+        plt.plot(self.t_iLQR[:-1],MF_bar,'k',label='Ref.')
         if plot_sim:
-            plt.plot(self.t_sim[:-1],MF,':^',label='Sim est.')
-            plt.plot(self.t_sim[:-1],MF_true,'--',label='Sim truth')
+            # plt.plot(self.t_sim[:-1],MF,':^',label='Sim est.')
+            plt.plot(self.t_sim[:-1],MF_true,'k--',label='Sim.')
         plt.xlabel('$t$, s')
         plt.ylabel('$\dot{m}_{fuel}$, kg/s')
         plt.title('Fuel mass flow at port end')
         plt.legend()
 
-        plt.figure()
-        plt.plot(self.t_iLQR[:-1],MOX_bar,label='$\dot{m}_{ox}$, ref.')
+        plt.subplot(326)
+        plt.plot(self.t_iLQR[:-1],MOX_bar,'k',label='Ref.')
         if plot_sim:
-            plt.plot(self.t_sim[:-1],MOX,':^',label='$\dot{m}_{ox}$, sim')
+            plt.plot(self.t_sim[:-1],MOX,'k--',label='Sim.')
         plt.xlabel('$t$, s')
         plt.ylabel('$\dot{m}_{ox}$, kg/s')
         plt.title('Oxidizer mass flow at port end')
         plt.legend()
         
+        plt.savefig('images/HybridOutput.png',bbox_inches='tight')
+        
         if plot_sim:
             plt.figure(figsize=(18, 6))
             plt.subplot(131)
-            plt.plot(self.t_sim[:-1], self.a_sim, label='$a$, sim est.')
-            plt.plot(self.t_sim[:-1], self.a_true, label='$a$, sim truth')
+            plt.plot(self.t_sim, self.a_sim, 'k', label='$a$, sim est.')
+            plt.plot(self.t_sim, self.a_true, 'k--', label='$a$, sim truth')
             plt.xlabel('$t$, s')
             plt.ylabel('$a$')
             plt.title('$a$ parameter estimation')
             plt.legend()
             plt.subplot(132)
-            plt.plot(self.t_sim[:-1], self.n_sim, label='$n$, sim est.')
-            plt.plot(self.t_sim[:-1], self.n_true, label='$n$, sim truth')
+            plt.plot(self.t_sim, self.n_sim, 'k', label='$n$, sim est.')
+            plt.plot(self.t_sim, self.n_true, 'k--', label='$n$, sim truth')
             plt.xlabel('$t$, s')
             plt.ylabel('$n$')
             plt.title('$n$ parameter estimation')
             plt.legend()
             plt.subplot(133)
-            plt.plot(self.t_sim[:-1], self.m_sim, label='$m$, sim est.')
-            plt.plot(self.t_sim[:-1], self.m_true, label='$m$, sim truth')
+            plt.plot(self.t_sim, self.m_sim, 'k', label='$m$, sim est.')
+            plt.plot(self.t_sim, self.m_true, 'k--', label='$m$, sim truth')
             plt.xlabel('$t$, s')
             plt.ylabel('$m$')
             plt.title('$m$ parameter estimation')

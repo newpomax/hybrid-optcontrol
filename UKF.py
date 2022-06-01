@@ -27,9 +27,8 @@ class UKF():
             k2 = dt * f(s + k1 / 2, u)
             k3 = dt * f(s + k2 / 2, u)
             k4 = dt * f(s + k3, u)
-            return s + (k1 + 2 * k2 + 2 * k3 + k4) / 6
-        # return integrator
-        return lambda s,u: s + dt*f(s,u)
+            return np.squeeze(s) + np.squeeze((k1 + 2 * k2 + 2 * k3 + k4))/ 6
+        return integrator
         
     def initialize(self,x0:np.ndarray, cov0:np.ndarray):
         ''' Set the state and covariance for the UKF (initiliazation or re-setting). '''
@@ -45,6 +44,9 @@ class UKF():
         xbar = np.zeros((2*self.n+1,self.n))
         for i in range(2*self.n+1):
             xbar[i] = self.f(xbar_last[i],ulast) # calculate expected transition for each point
+            if np.any(np.isnan(xbar[i])):
+                print(xbar_last[i])
+                print(ulast)
         xp, covp = self.sig_inv(xbar)
         # Update
         xbar_new = self.sig_point(xp, covp)

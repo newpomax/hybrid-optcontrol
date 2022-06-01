@@ -3,9 +3,14 @@ import cvxpy as cvx
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+import matplotlib as mpl
 from tqdm.auto import tqdm
 from functools import partial
 import cvxpy as cvx
+
+mpl.rc('font', family='serif') 
+mpl.rc('font', serif='Times New Roman') 
+mpl.rc('text', usetex='true') 
 
 @partial(jax.jit)
 def regularize(A: jnp.ndarray, λ:float):
@@ -157,7 +162,7 @@ def simulate(fd:callable, c:callable, h:callable, L: np.ndarray, l:np.ndarray, u
     return s, u, cost
 
 def iLQR(f:callable, c:callable, h:callable, u_ref: np.ndarray, N: int, s0: np.ndarray, u_range:np.ndarray,
-         tspan:np.ndarray, max_iters:int = 400, tol: float = 1E-4, λmax:float= 1000):
+         tspan:np.ndarray, max_iters:int = 400, tol: float = 1E-4, λmax:float= 1E3):
     """ Solve the iLQR problem for a system with discrete dynamics `f(s,u)`, cost function
         `c(s,u)`, terminal cost `h(s)`, initial reference control `uref`, number of time steps `N+1`, initial state `s0`,
         time step `dt`, max number of iterations 'max_iters', and convergence tolerance `tol`.
